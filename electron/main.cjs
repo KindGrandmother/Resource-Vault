@@ -3,15 +3,22 @@ const { randomUUID } = require('node:crypto');
 const {
   app,
   BrowserWindow,
+  Notification,
   ipcMain,
   safeStorage,
   shell,
   clipboard,
 } = require('electron');
-const { ResourceDatabase } = require('./database.cjs');
+const { ResourceDatabase, isAccountType } = require('./database.cjs');
 
 let mainWindow;
 let resourceDb;
+let notificationTimer;
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+}
 
 function isTrustedSender(event) {
   const url = event.senderFrame?.url || '';
@@ -61,7 +68,7 @@ async function revealResource(raw) {
     d.uid = await decryptSecret(d.uidSecret);
     delete d.cardNumberSecret;
     delete d.uidSecret;
-  } else if (result.type === 'linkedin_account') {
+  } else if (isAccountType(result.type)) {
     d.dob = await decryptSecret(d.dobSecret);
     d.streetAddress = await decryptSecret(d.streetAddressSecret);
     d.ssn = await decryptSecret(d.ssnSecret);
@@ -104,15 +111,18 @@ async function prepareForSave(payload) {
     delete d.uid;
     delete d.depositAmount;
     delete d.currentAmount;
-  } else if (resource.type === 'linkedin_account') {
+  } else if (isAccountType(resource.type)) {
     const ssnDigits = String(d.ssn || '').replace(/\D/g, '');
     d.ssnLast4 = ssnDigits.slice(-4);
+    d.profileUrl = d.profileUrl || d.linkedinUrl || d.upworkUrl || '';
     d.dobSecret = await encryptSecret(d.dob);
     d.streetAddressSecret = await encryptSecret(d.streetAddress);
     d.ssnSecret = await encryptSecret(d.ssn);
     d.driverLicenseSecret = await encryptSecret(d.driverLicense);
     d.passwordSecret = await encryptSecret(d.password);
 
+    delete d.linkedinUrl;
+    delete d.upworkUrl;
     delete d.dob;
     delete d.streetAddress;
     delete d.ssn;
@@ -126,6 +136,53 @@ async function prepareForSave(payload) {
   }
 
   return resource;
+}
+
+function focusMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createWindow();
+    return;
+  }
+
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function showExpirationNotifications() {
+  if (!resourceDb || !Notification.isSupported()) return;
+
+  const dueItems = resourceDb.getDueExpirationNotifications([7, 3]);
+
+  dueItems.forEach((item) => {
+    const plural = item.remainingDays === 1 ? 'day' : 'days';
+    const notification = new Notification({
+      title: `${item.remainingDays}-day expiration reminder`,
+      body: `${item.label} expires in ${item.remainingDays} ${plural} (${item.expiresAt}).`,
+      silent: false,
+      timeoutType: 'default',
+    });
+
+    notification.on('click', focusMainWindow);
+    notification.show();
+
+    resourceDb.markExpirationNotificationSent(
+      item.id,
+      item.remainingDays,
+      item.expiresAt,
+    );
+  });
+}
+
+function startNotificationScheduler() {
+  showExpirationNotifications();
+
+  if (notificationTimer) clearInterval(notificationTimer);
+  notificationTimer = setInterval(
+    showExpirationNotifications,
+    60 * 60 * 1000,
+  );
+  notificationTimer.unref?.();
 }
 
 function registerIpcHandlers() {
@@ -148,6 +205,7 @@ function registerIpcHandlers() {
     assertTrusted(event);
     const prepared = await prepareForSave(payload);
     const saved = resourceDb.saveResource(prepared);
+    setTimeout(showExpirationNotifications, 250);
     return revealResource(saved);
   });
 
@@ -167,8 +225,8 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 920,
-    minWidth: 1080,
-    minHeight: 720,
+    minWidth: 720,
+    minHeight: 600,
     title: 'Resource Vault',
     backgroundColor: '#0b1020',
     show: false,
@@ -203,13 +261,25 @@ function createWindow() {
   }
 }
 
+app.on('second-instance', focusMainWindow);
+
 app.whenReady().then(() => {
+  app.setAppUserModelId('com.local.resourcevault');
+
   resourceDb = new ResourceDatabase(
     path.join(app.getPath('userData'), 'resource-vault.sqlite'),
   );
 
+  if (app.isPackaged) {
+    app.setLoginItemSettings({
+      openAtLogin: true,
+      path: process.execPath,
+    });
+  }
+
   registerIpcHandlers();
   createWindow();
+  startNotificationScheduler();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -221,5 +291,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  if (notificationTimer) clearInterval(notificationTimer);
   resourceDb?.close();
 });

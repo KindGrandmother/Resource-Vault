@@ -4,7 +4,10 @@ export type ResourceType =
   | 'slynumber'
   | 'google_voice'
   | 'whatsapp'
-  | 'linkedin_account';
+  | 'linkedin_account'
+  | 'upwork_account';
+
+export type AccountResourceType = 'linkedin_account' | 'upwork_account';
 
 export type ResourceStatus = 'active' | 'inactive' | 'expired' | 'archived';
 

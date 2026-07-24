@@ -7,7 +7,29 @@ const RESOURCE_TYPES = new Set([
   'google_voice',
   'whatsapp',
   'linkedin_account',
+  'upwork_account',
 ]);
+
+const ACCOUNT_TABLES = Object.freeze({
+  linkedin_account: {
+    label: 'LinkedIn',
+    details: 'linkedin_account_details',
+    employment: 'linkedin_employment_history',
+    education: 'linkedin_education',
+    urlColumn: 'linkedin_url',
+  },
+  upwork_account: {
+    label: 'Upwork',
+    details: 'upwork_account_details',
+    employment: 'upwork_employment_history',
+    education: 'upwork_education',
+    urlColumn: 'upwork_url',
+  },
+});
+
+function isAccountType(type) {
+  return Object.prototype.hasOwnProperty.call(ACCOUNT_TABLES, type);
+}
 
 class ResourceDatabase {
   constructor(filePath) {
@@ -16,7 +38,8 @@ class ResourceDatabase {
     this.db.pragma('foreign_keys = ON');
     this.migrateResourcesTypeConstraint();
     this.createSchema();
-    this.db.pragma('user_version = 2');
+    this.db.pragma('user_version = 3');
+    this.cleanupNotificationLog();
   }
 
   migrateResourcesTypeConstraint() {
@@ -26,7 +49,7 @@ class ResourceDatabase {
       WHERE type = 'table' AND name = 'resources'
     `).get();
 
-    if (!table || String(table.sql || '').includes("'linkedin_account'")) return;
+    if (!table || String(table.sql || '').includes("'upwork_account'")) return;
 
     this.db.pragma('foreign_keys = OFF');
 
@@ -43,7 +66,8 @@ class ResourceDatabase {
               'slynumber',
               'google_voice',
               'whatsapp',
-              'linkedin_account'
+              'linkedin_account',
+              'upwork_account'
             )),
             label TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active'
@@ -87,7 +111,8 @@ class ResourceDatabase {
           'slynumber',
           'google_voice',
           'whatsapp',
-          'linkedin_account'
+          'linkedin_account',
+          'upwork_account'
         )),
         label TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active'
@@ -178,6 +203,61 @@ class ResourceDatabase {
         FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS upwork_account_details (
+        resource_id TEXT PRIMARY KEY,
+        first_name TEXT NOT NULL DEFAULT '',
+        last_name TEXT NOT NULL DEFAULT '',
+        dob_secret TEXT,
+        street_address_secret TEXT,
+        county TEXT NOT NULL DEFAULT '',
+        city TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT '',
+        zip_code TEXT NOT NULL DEFAULT '',
+        ssn_last4 TEXT NOT NULL DEFAULT '',
+        ssn_secret TEXT,
+        driver_license_secret TEXT,
+        driver_license_state TEXT NOT NULL DEFAULT '',
+        upwork_url TEXT NOT NULL DEFAULT '',
+        email TEXT NOT NULL DEFAULT '',
+        password_secret TEXT,
+        FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS upwork_employment_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_id TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        job_title TEXT NOT NULL DEFAULT '',
+        company TEXT NOT NULL DEFAULT '',
+        employment_type TEXT NOT NULL DEFAULT '',
+        start_date TEXT,
+        end_date TEXT,
+        is_current INTEGER NOT NULL DEFAULT 0 CHECK(is_current IN (0, 1)),
+        FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS upwork_education (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_id TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        school TEXT NOT NULL DEFAULT '',
+        degree TEXT NOT NULL DEFAULT '',
+        start_year INTEGER,
+        end_year INTEGER,
+        location TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS notification_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource_id TEXT NOT NULL,
+        threshold_days INTEGER NOT NULL CHECK(threshold_days IN (3, 7)),
+        expiration_date TEXT NOT NULL,
+        sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(resource_id, threshold_days, expiration_date),
+        FOREIGN KEY(resource_id) REFERENCES resources(id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_resources_type ON resources(type);
       CREATE INDEX IF NOT EXISTS idx_resources_status ON resources(status);
       CREATE INDEX IF NOT EXISTS idx_resources_expires ON resources(expires_at);
@@ -190,7 +270,23 @@ class ResourceDatabase {
         ON linkedin_employment_history(resource_id, sort_order);
       CREATE INDEX IF NOT EXISTS idx_linkedin_education_resource
         ON linkedin_education(resource_id, sort_order);
+      CREATE INDEX IF NOT EXISTS idx_upwork_email ON upwork_account_details(email);
+      CREATE INDEX IF NOT EXISTS idx_upwork_name
+        ON upwork_account_details(last_name, first_name);
+      CREATE INDEX IF NOT EXISTS idx_upwork_employment_resource
+        ON upwork_employment_history(resource_id, sort_order);
+      CREATE INDEX IF NOT EXISTS idx_upwork_education_resource
+        ON upwork_education(resource_id, sort_order);
+      CREATE INDEX IF NOT EXISTS idx_notification_lookup
+        ON notification_log(resource_id, threshold_days, expiration_date);
     `);
+  }
+
+  cleanupNotificationLog() {
+    this.db.prepare(`
+      DELETE FROM notification_log
+      WHERE date(expiration_date) < date('now', 'localtime', '-365 days')
+    `).run();
   }
 
   getDashboard() {
@@ -199,12 +295,14 @@ class ResourceDatabase {
         COUNT(*) AS total,
         SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active,
         SUM(CASE
-          WHEN expires_at IS NOT NULL AND date(expires_at) < date('now')
+          WHEN expires_at IS NOT NULL
+            AND date(expires_at) < date('now', 'localtime')
           THEN 1 ELSE 0 END
         ) AS expired,
         SUM(CASE
           WHEN expires_at IS NOT NULL
-            AND date(expires_at) BETWEEN date('now') AND date('now', '+30 days')
+            AND date(expires_at) BETWEEN
+              date('now', 'localtime') AND date('now', 'localtime', '+30 days')
           THEN 1 ELSE 0 END
         ) AS expiring30
       FROM resources
@@ -225,9 +323,10 @@ class ResourceDatabase {
       SELECT id, type, label, status, expires_at AS expiresAt
       FROM resources
       WHERE expires_at IS NOT NULL
-        AND date(expires_at) >= date('now')
+        AND date(expires_at) >= date('now', 'localtime')
+        AND status <> 'archived'
       ORDER BY date(expires_at) ASC
-      LIMIT 6
+      LIMIT 8
     `).all();
 
     return {
@@ -272,6 +371,10 @@ class ResourceDatabase {
         li.last_name LIKE @search OR
         li.email LIKE @search OR
         li.linkedin_url LIKE @search OR
+        up.first_name LIKE @search OR
+        up.last_name LIKE @search OR
+        up.email LIKE @search OR
+        up.upwork_url LIKE @search OR
         EXISTS (
           SELECT 1
           FROM linkedin_employment_history leh
@@ -290,6 +393,26 @@ class ResourceDatabase {
               led.school LIKE @search OR
               led.degree LIKE @search OR
               led.location LIKE @search
+            )
+        ) OR
+        EXISTS (
+          SELECT 1
+          FROM upwork_employment_history ueh
+          WHERE ueh.resource_id = r.id
+            AND (
+              ueh.job_title LIKE @search OR
+              ueh.company LIKE @search OR
+              ueh.employment_type LIKE @search
+            )
+        ) OR
+        EXISTS (
+          SELECT 1
+          FROM upwork_education ued
+          WHERE ued.resource_id = r.id
+            AND (
+              ued.school LIKE @search OR
+              ued.degree LIKE @search OR
+              ued.location LIKE @search
             )
         )
       )`);
@@ -319,15 +442,20 @@ class ResourceDatabase {
         ph.related_email AS relatedEmail,
         ph.contact_name AS contactName,
         ph.used_services AS usedServices,
-        li.first_name AS firstName,
-        li.last_name AS lastName,
+        li.first_name AS linkedinFirstName,
+        li.last_name AS linkedinLastName,
         li.email AS linkedinEmail,
-        li.linkedin_url AS linkedinUrl
+        li.linkedin_url AS linkedinUrl,
+        up.first_name AS upworkFirstName,
+        up.last_name AS upworkLastName,
+        up.email AS upworkEmail,
+        up.upwork_url AS upworkUrl
       FROM resources r
       LEFT JOIN proxy_details p ON p.resource_id = r.id
       LEFT JOIN gift_card_details g ON g.resource_id = r.id
       LEFT JOIN phone_details ph ON ph.resource_id = r.id
       LEFT JOIN linkedin_account_details li ON li.resource_id = r.id
+      LEFT JOIN upwork_account_details up ON up.resource_id = r.id
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY
         CASE WHEN r.status = 'active' THEN 0 ELSE 1 END,
@@ -356,8 +484,19 @@ class ResourceDatabase {
     }
 
     if (row.type === 'linkedin_account') {
-      const fullName = [row.firstName, row.lastName].filter(Boolean).join(' ');
+      const fullName = [row.linkedinFirstName, row.linkedinLastName]
+        .filter(Boolean)
+        .join(' ');
       return [fullName || 'LinkedIn account', row.linkedinEmail]
+        .filter(Boolean)
+        .join(' • ');
+    }
+
+    if (row.type === 'upwork_account') {
+      const fullName = [row.upworkFirstName, row.upworkLastName]
+        .filter(Boolean)
+        .join(' ');
+      return [fullName || 'Upwork account', row.upworkEmail]
         .filter(Boolean)
         .join(' • ');
     }
@@ -410,61 +549,8 @@ class ResourceDatabase {
         FROM gift_card_details
         WHERE resource_id = ?
       `).get(id) || {};
-    } else if (base.type === 'linkedin_account') {
-      const details = this.db.prepare(`
-        SELECT
-          first_name AS firstName,
-          last_name AS lastName,
-          dob_secret AS dobSecret,
-          street_address_secret AS streetAddressSecret,
-          county,
-          city,
-          state,
-          zip_code AS zipCode,
-          ssn_last4 AS ssnLast4,
-          ssn_secret AS ssnSecret,
-          driver_license_secret AS driverLicenseSecret,
-          driver_license_state AS driverLicenseState,
-          linkedin_url AS linkedinUrl,
-          email,
-          password_secret AS passwordSecret
-        FROM linkedin_account_details
-        WHERE resource_id = ?
-      `).get(id) || {};
-
-      details.employmentHistory = this.db.prepare(`
-        SELECT
-          job_title AS jobTitle,
-          company,
-          employment_type AS employmentType,
-          COALESCE(start_date, '') AS startDate,
-          COALESCE(end_date, '') AS endDate,
-          is_current AS isCurrent
-        FROM linkedin_employment_history
-        WHERE resource_id = ?
-        ORDER BY sort_order ASC, id ASC
-      `).all(id).map((row) => ({
-        ...row,
-        isCurrent: Boolean(row.isCurrent),
-      }));
-
-      details.education = this.db.prepare(`
-        SELECT
-          school,
-          degree,
-          start_year AS startYear,
-          end_year AS endYear,
-          location
-        FROM linkedin_education
-        WHERE resource_id = ?
-        ORDER BY sort_order ASC, id ASC
-      `).all(id).map((row) => ({
-        ...row,
-        startYear: row.startYear ? String(row.startYear) : '',
-        endYear: row.endYear ? String(row.endYear) : '',
-      }));
-
-      base.details = details;
+    } else if (isAccountType(base.type)) {
+      base.details = this.getAccountDetails(base.type, id);
     } else {
       base.details = this.db.prepare(`
         SELECT
@@ -479,6 +565,64 @@ class ResourceDatabase {
     }
 
     return base;
+  }
+
+  getAccountDetails(type, id) {
+    const tables = ACCOUNT_TABLES[type];
+    const details = this.db.prepare(`
+      SELECT
+        first_name AS firstName,
+        last_name AS lastName,
+        dob_secret AS dobSecret,
+        street_address_secret AS streetAddressSecret,
+        county,
+        city,
+        state,
+        zip_code AS zipCode,
+        ssn_last4 AS ssnLast4,
+        ssn_secret AS ssnSecret,
+        driver_license_secret AS driverLicenseSecret,
+        driver_license_state AS driverLicenseState,
+        ${tables.urlColumn} AS profileUrl,
+        email,
+        password_secret AS passwordSecret
+      FROM ${tables.details}
+      WHERE resource_id = ?
+    `).get(id) || {};
+
+    details.employmentHistory = this.db.prepare(`
+      SELECT
+        job_title AS jobTitle,
+        company,
+        employment_type AS employmentType,
+        COALESCE(start_date, '') AS startDate,
+        COALESCE(end_date, '') AS endDate,
+        is_current AS isCurrent
+      FROM ${tables.employment}
+      WHERE resource_id = ?
+      ORDER BY sort_order ASC, id ASC
+    `).all(id).map((row) => ({
+      ...row,
+      isCurrent: Boolean(row.isCurrent),
+    }));
+
+    details.education = this.db.prepare(`
+      SELECT
+        school,
+        degree,
+        start_year AS startYear,
+        end_year AS endYear,
+        location
+      FROM ${tables.education}
+      WHERE resource_id = ?
+      ORDER BY sort_order ASC, id ASC
+    `).all(id).map((row) => ({
+      ...row,
+      startYear: row.startYear ? String(row.startYear) : '',
+      endYear: row.endYear ? String(row.endYear) : '',
+    }));
+
+    return details;
   }
 
   saveResource(resource) {
@@ -513,275 +657,334 @@ class ResourceDatabase {
         notes: resource.notes || '',
       });
 
-      this.db.prepare(
-        'DELETE FROM linkedin_employment_history WHERE resource_id = ?',
-      ).run(resource.id);
-      this.db.prepare(
-        'DELETE FROM linkedin_education WHERE resource_id = ?',
-      ).run(resource.id);
-      this.db.prepare(
-        'DELETE FROM linkedin_account_details WHERE resource_id = ?',
-      ).run(resource.id);
-      this.db.prepare(
-        'DELETE FROM proxy_details WHERE resource_id = ?',
-      ).run(resource.id);
-      this.db.prepare(
-        'DELETE FROM gift_card_details WHERE resource_id = ?',
-      ).run(resource.id);
-      this.db.prepare(
-        'DELETE FROM phone_details WHERE resource_id = ?',
-      ).run(resource.id);
-
+      this.deleteAllDetails(resource.id);
       const d = resource.details || {};
 
       if (resource.type === 'proxy') {
-        if (!String(d.ipAddress || '').trim()) {
-          throw new Error('IP address is required.');
-        }
-
-        this.db.prepare(`
-          INSERT INTO proxy_details (
-            resource_id,
-            ip_address,
-            country,
-            proxy_type,
-            port,
-            username_secret,
-            password_secret,
-            order_number
-          ) VALUES (
-            @resourceId,
-            @ipAddress,
-            @country,
-            @proxyType,
-            @port,
-            @usernameSecret,
-            @passwordSecret,
-            @orderNumber
-          )
-        `).run({
-          resourceId: resource.id,
-          ipAddress: String(d.ipAddress).trim(),
-          country: d.country || '',
-          proxyType: d.proxyType || '',
-          port: d.port ? Number(d.port) : null,
-          usernameSecret: d.usernameSecret || null,
-          passwordSecret: d.passwordSecret || null,
-          orderNumber: d.orderNumber || '',
-        });
+        this.saveProxy(resource.id, d);
       } else if (resource.type === 'gift_card') {
-        this.db.prepare(`
-          INSERT INTO gift_card_details (
-            resource_id,
-            issuer,
-            card_last4,
-            card_number_secret,
-            uid_secret,
-            deposit_amount_cents,
-            current_amount_cents
-          ) VALUES (
-            @resourceId,
-            @issuer,
-            @cardLast4,
-            @cardNumberSecret,
-            @uidSecret,
-            @depositAmountCents,
-            @currentAmountCents
-          )
-        `).run({
-          resourceId: resource.id,
-          issuer: d.issuer || '',
-          cardLast4: d.cardLast4 || '',
-          cardNumberSecret: d.cardNumberSecret || null,
-          uidSecret: d.uidSecret || null,
-          depositAmountCents: Number(d.depositAmountCents || 0),
-          currentAmountCents: Number(d.currentAmountCents || 0),
-        });
-      } else if (resource.type === 'linkedin_account') {
-        const firstName = String(d.firstName || '').trim();
-        const lastName = String(d.lastName || '').trim();
-        const email = String(d.email || '').trim();
-
-        if (!firstName || !lastName) {
-          throw new Error('First name and last name are required.');
-        }
-        if (!email) {
-          throw new Error('LinkedIn account email is required.');
-        }
-
-        this.db.prepare(`
-          INSERT INTO linkedin_account_details (
-            resource_id,
-            first_name,
-            last_name,
-            dob_secret,
-            street_address_secret,
-            county,
-            city,
-            state,
-            zip_code,
-            ssn_last4,
-            ssn_secret,
-            driver_license_secret,
-            driver_license_state,
-            linkedin_url,
-            email,
-            password_secret
-          ) VALUES (
-            @resourceId,
-            @firstName,
-            @lastName,
-            @dobSecret,
-            @streetAddressSecret,
-            @county,
-            @city,
-            @state,
-            @zipCode,
-            @ssnLast4,
-            @ssnSecret,
-            @driverLicenseSecret,
-            @driverLicenseState,
-            @linkedinUrl,
-            @email,
-            @passwordSecret
-          )
-        `).run({
-          resourceId: resource.id,
-          firstName,
-          lastName,
-          dobSecret: d.dobSecret || null,
-          streetAddressSecret: d.streetAddressSecret || null,
-          county: d.county || '',
-          city: d.city || '',
-          state: d.state || '',
-          zipCode: d.zipCode || '',
-          ssnLast4: d.ssnLast4 || '',
-          ssnSecret: d.ssnSecret || null,
-          driverLicenseSecret: d.driverLicenseSecret || null,
-          driverLicenseState: d.driverLicenseState || '',
-          linkedinUrl: d.linkedinUrl || '',
-          email,
-          passwordSecret: d.passwordSecret || null,
-        });
-
-        const employmentInsert = this.db.prepare(`
-          INSERT INTO linkedin_employment_history (
-            resource_id,
-            sort_order,
-            job_title,
-            company,
-            employment_type,
-            start_date,
-            end_date,
-            is_current
-          ) VALUES (
-            @resourceId,
-            @sortOrder,
-            @jobTitle,
-            @company,
-            @employmentType,
-            @startDate,
-            @endDate,
-            @isCurrent
-          )
-        `);
-
-        const employmentHistory = Array.isArray(d.employmentHistory)
-          ? d.employmentHistory
-          : [];
-
-        employmentHistory.forEach((entry, index) => {
-          const item = entry && typeof entry === 'object' ? entry : {};
-          const jobTitle = String(item.jobTitle || '').trim();
-          const company = String(item.company || '').trim();
-
-          if (!jobTitle && !company) return;
-
-          employmentInsert.run({
-            resourceId: resource.id,
-            sortOrder: index,
-            jobTitle,
-            company,
-            employmentType: String(item.employmentType || '').trim(),
-            startDate: item.startDate || null,
-            endDate: item.isCurrent ? null : item.endDate || null,
-            isCurrent: item.isCurrent ? 1 : 0,
-          });
-        });
-
-        const educationInsert = this.db.prepare(`
-          INSERT INTO linkedin_education (
-            resource_id,
-            sort_order,
-            school,
-            degree,
-            start_year,
-            end_year,
-            location
-          ) VALUES (
-            @resourceId,
-            @sortOrder,
-            @school,
-            @degree,
-            @startYear,
-            @endYear,
-            @location
-          )
-        `);
-
-        const education = Array.isArray(d.education) ? d.education : [];
-
-        education.forEach((entry, index) => {
-          const item = entry && typeof entry === 'object' ? entry : {};
-          const school = String(item.school || '').trim();
-          const degree = String(item.degree || '').trim();
-
-          if (!school && !degree) return;
-
-          educationInsert.run({
-            resourceId: resource.id,
-            sortOrder: index,
-            school,
-            degree,
-            startYear: item.startYear ? Number(item.startYear) : null,
-            endYear: item.endYear ? Number(item.endYear) : null,
-            location: String(item.location || '').trim(),
-          });
-        });
+        this.saveGiftCard(resource.id, d);
+      } else if (isAccountType(resource.type)) {
+        this.saveAccount(resource.type, resource.id, d);
       } else {
-        if (!d.phoneNumberSecret) {
-          throw new Error('Phone number is required.');
-        }
-
-        this.db.prepare(`
-          INSERT INTO phone_details (
-            resource_id,
-            phone_number_secret,
-            phone_last4,
-            related_email,
-            contact_name,
-            used_services
-          ) VALUES (
-            @resourceId,
-            @phoneNumberSecret,
-            @phoneLast4,
-            @relatedEmail,
-            @contactName,
-            @usedServices
-          )
-        `).run({
-          resourceId: resource.id,
-          phoneNumberSecret: d.phoneNumberSecret,
-          phoneLast4: d.phoneLast4 || '',
-          relatedEmail: d.relatedEmail || '',
-          contactName: d.contactName || '',
-          usedServices: d.usedServices || '',
-        });
+        this.savePhone(resource.id, d);
       }
     });
 
     save();
     return this.getRawResource(resource.id);
+  }
+
+  deleteAllDetails(resourceId) {
+    const tables = [
+      'linkedin_employment_history',
+      'linkedin_education',
+      'upwork_employment_history',
+      'upwork_education',
+      'linkedin_account_details',
+      'upwork_account_details',
+      'proxy_details',
+      'gift_card_details',
+      'phone_details',
+    ];
+
+    tables.forEach((table) => {
+      this.db.prepare(`DELETE FROM ${table} WHERE resource_id = ?`).run(resourceId);
+    });
+  }
+
+  saveProxy(resourceId, d) {
+    if (!String(d.ipAddress || '').trim()) {
+      throw new Error('IP address is required.');
+    }
+
+    this.db.prepare(`
+      INSERT INTO proxy_details (
+        resource_id,
+        ip_address,
+        country,
+        proxy_type,
+        port,
+        username_secret,
+        password_secret,
+        order_number
+      ) VALUES (
+        @resourceId,
+        @ipAddress,
+        @country,
+        @proxyType,
+        @port,
+        @usernameSecret,
+        @passwordSecret,
+        @orderNumber
+      )
+    `).run({
+      resourceId,
+      ipAddress: String(d.ipAddress).trim(),
+      country: d.country || '',
+      proxyType: d.proxyType || '',
+      port: d.port ? Number(d.port) : null,
+      usernameSecret: d.usernameSecret || null,
+      passwordSecret: d.passwordSecret || null,
+      orderNumber: d.orderNumber || '',
+    });
+  }
+
+  saveGiftCard(resourceId, d) {
+    this.db.prepare(`
+      INSERT INTO gift_card_details (
+        resource_id,
+        issuer,
+        card_last4,
+        card_number_secret,
+        uid_secret,
+        deposit_amount_cents,
+        current_amount_cents
+      ) VALUES (
+        @resourceId,
+        @issuer,
+        @cardLast4,
+        @cardNumberSecret,
+        @uidSecret,
+        @depositAmountCents,
+        @currentAmountCents
+      )
+    `).run({
+      resourceId,
+      issuer: d.issuer || '',
+      cardLast4: d.cardLast4 || '',
+      cardNumberSecret: d.cardNumberSecret || null,
+      uidSecret: d.uidSecret || null,
+      depositAmountCents: Number(d.depositAmountCents || 0),
+      currentAmountCents: Number(d.currentAmountCents || 0),
+    });
+  }
+
+  savePhone(resourceId, d) {
+    if (!d.phoneNumberSecret) {
+      throw new Error('Phone number is required.');
+    }
+
+    this.db.prepare(`
+      INSERT INTO phone_details (
+        resource_id,
+        phone_number_secret,
+        phone_last4,
+        related_email,
+        contact_name,
+        used_services
+      ) VALUES (
+        @resourceId,
+        @phoneNumberSecret,
+        @phoneLast4,
+        @relatedEmail,
+        @contactName,
+        @usedServices
+      )
+    `).run({
+      resourceId,
+      phoneNumberSecret: d.phoneNumberSecret,
+      phoneLast4: d.phoneLast4 || '',
+      relatedEmail: d.relatedEmail || '',
+      contactName: d.contactName || '',
+      usedServices: d.usedServices || '',
+    });
+  }
+
+  saveAccount(type, resourceId, d) {
+    const tables = ACCOUNT_TABLES[type];
+    const firstName = String(d.firstName || '').trim();
+    const lastName = String(d.lastName || '').trim();
+    const email = String(d.email || '').trim();
+
+    if (!firstName || !lastName) {
+      throw new Error('First name and last name are required.');
+    }
+    if (!email) {
+      throw new Error(`${tables.label} account email is required.`);
+    }
+
+    this.db.prepare(`
+      INSERT INTO ${tables.details} (
+        resource_id,
+        first_name,
+        last_name,
+        dob_secret,
+        street_address_secret,
+        county,
+        city,
+        state,
+        zip_code,
+        ssn_last4,
+        ssn_secret,
+        driver_license_secret,
+        driver_license_state,
+        ${tables.urlColumn},
+        email,
+        password_secret
+      ) VALUES (
+        @resourceId,
+        @firstName,
+        @lastName,
+        @dobSecret,
+        @streetAddressSecret,
+        @county,
+        @city,
+        @state,
+        @zipCode,
+        @ssnLast4,
+        @ssnSecret,
+        @driverLicenseSecret,
+        @driverLicenseState,
+        @profileUrl,
+        @email,
+        @passwordSecret
+      )
+    `).run({
+      resourceId,
+      firstName,
+      lastName,
+      dobSecret: d.dobSecret || null,
+      streetAddressSecret: d.streetAddressSecret || null,
+      county: d.county || '',
+      city: d.city || '',
+      state: d.state || '',
+      zipCode: d.zipCode || '',
+      ssnLast4: d.ssnLast4 || '',
+      ssnSecret: d.ssnSecret || null,
+      driverLicenseSecret: d.driverLicenseSecret || null,
+      driverLicenseState: d.driverLicenseState || '',
+      profileUrl: d.profileUrl || '',
+      email,
+      passwordSecret: d.passwordSecret || null,
+    });
+
+    const employmentInsert = this.db.prepare(`
+      INSERT INTO ${tables.employment} (
+        resource_id,
+        sort_order,
+        job_title,
+        company,
+        employment_type,
+        start_date,
+        end_date,
+        is_current
+      ) VALUES (
+        @resourceId,
+        @sortOrder,
+        @jobTitle,
+        @company,
+        @employmentType,
+        @startDate,
+        @endDate,
+        @isCurrent
+      )
+    `);
+
+    const employmentHistory = Array.isArray(d.employmentHistory)
+      ? d.employmentHistory
+      : [];
+
+    employmentHistory.forEach((entry, index) => {
+      const item = entry && typeof entry === 'object' ? entry : {};
+      const jobTitle = String(item.jobTitle || '').trim();
+      const company = String(item.company || '').trim();
+
+      if (!jobTitle && !company) return;
+
+      employmentInsert.run({
+        resourceId,
+        sortOrder: index,
+        jobTitle,
+        company,
+        employmentType: String(item.employmentType || '').trim(),
+        startDate: item.startDate || null,
+        endDate: item.isCurrent ? null : item.endDate || null,
+        isCurrent: item.isCurrent ? 1 : 0,
+      });
+    });
+
+    const educationInsert = this.db.prepare(`
+      INSERT INTO ${tables.education} (
+        resource_id,
+        sort_order,
+        school,
+        degree,
+        start_year,
+        end_year,
+        location
+      ) VALUES (
+        @resourceId,
+        @sortOrder,
+        @school,
+        @degree,
+        @startYear,
+        @endYear,
+        @location
+      )
+    `);
+
+    const education = Array.isArray(d.education) ? d.education : [];
+
+    education.forEach((entry, index) => {
+      const item = entry && typeof entry === 'object' ? entry : {};
+      const school = String(item.school || '').trim();
+      const degree = String(item.degree || '').trim();
+
+      if (!school && !degree) return;
+
+      educationInsert.run({
+        resourceId,
+        sortOrder: index,
+        school,
+        degree,
+        startYear: item.startYear ? Number(item.startYear) : null,
+        endYear: item.endYear ? Number(item.endYear) : null,
+        location: String(item.location || '').trim(),
+      });
+    });
+  }
+
+  getDueExpirationNotifications(reminderDays = [7, 3]) {
+    const days = [...new Set(reminderDays)]
+      .map((value) => Number(value))
+      .filter((value) => value === 7 || value === 3);
+
+    const findDue = this.db.prepare(`
+      SELECT
+        r.id,
+        r.type,
+        r.label,
+        r.expires_at AS expiresAt,
+        @thresholdDays AS remainingDays
+      FROM resources r
+      WHERE r.expires_at IS NOT NULL
+        AND r.status NOT IN ('expired', 'archived')
+        AND date(r.expires_at) = date('now', 'localtime', @modifier)
+        AND NOT EXISTS (
+          SELECT 1
+          FROM notification_log n
+          WHERE n.resource_id = r.id
+            AND n.threshold_days = @thresholdDays
+            AND n.expiration_date = r.expires_at
+        )
+      ORDER BY r.label COLLATE NOCASE
+    `);
+
+    return days.flatMap((thresholdDays) => findDue.all({
+      thresholdDays,
+      modifier: `+${thresholdDays} days`,
+    }));
+  }
+
+  markExpirationNotificationSent(resourceId, thresholdDays, expirationDate) {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO notification_log (
+        resource_id,
+        threshold_days,
+        expiration_date
+      ) VALUES (?, ?, ?)
+    `).run(resourceId, Number(thresholdDays), expirationDate);
   }
 
   deleteResource(id) {
@@ -794,4 +997,9 @@ class ResourceDatabase {
   }
 }
 
-module.exports = { ResourceDatabase, RESOURCE_TYPES };
+module.exports = {
+  ResourceDatabase,
+  RESOURCE_TYPES,
+  ACCOUNT_TABLES,
+  isAccountType,
+};

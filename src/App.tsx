@@ -43,6 +43,7 @@ const typeMeta: Record<ResourceType, { label: string; icon: typeof Globe2 }> = {
   google_voice: { label: 'Google Voice', icon: Phone },
   whatsapp: { label: 'WhatsApp', icon: MessageCircle },
   linkedin_account: { label: 'LinkedIn Accounts', icon: UserRound },
+  upwork_account: { label: 'Upwork Accounts', icon: Briefcase },
 };
 
 const emptyEmployment = (): LinkedInEmployment => ({
@@ -62,13 +63,19 @@ const emptyEducation = (): LinkedInEducation => ({
   location: '',
 });
 
+const ACCOUNT_TYPES: ResourceType[] = ['linkedin_account', 'upwork_account'];
+
+function isAccountType(type: ResourceType): boolean {
+  return ACCOUNT_TYPES.includes(type);
+}
+
 const emptyPayload = (type: ResourceType = 'proxy'): ResourcePayload => ({
   type,
   label: '',
   status: 'active',
   expiresAt: '',
   notes: '',
-  details: type === 'linkedin_account'
+  details: isAccountType(type)
     ? {
         employmentHistory: [emptyEmployment()],
         education: [emptyEducation()],
@@ -197,6 +204,31 @@ function App() {
     return () => clearTimeout(timer);
   }, [load]);
 
+  useEffect(() => {
+    if (!menuId) return undefined;
+
+    const closeMenu = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('[data-action-menu]')) return;
+      setMenuId(null);
+    };
+
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setMenuId(null);
+    };
+    const closeOnWindowBlur = () => setMenuId(null);
+
+    document.addEventListener('pointerdown', closeMenu);
+    document.addEventListener('keydown', closeOnEscape);
+    window.addEventListener('blur', closeOnWindowBlur);
+
+    return () => {
+      document.removeEventListener('pointerdown', closeMenu);
+      document.removeEventListener('keydown', closeOnEscape);
+      window.removeEventListener('blur', closeOnWindowBlur);
+    };
+  }, [menuId]);
+
   async function openEdit(id: string) {
     setMenuId(null);
     const item = await window.resourceAPI.getResource(id);
@@ -243,7 +275,7 @@ function App() {
         <nav className="nav-stack">
           <button
             className={!typeFilter ? 'nav-item active' : 'nav-item'}
-            onClick={() => setTypeFilter('')}
+            onClick={() => { setTypeFilter(''); setMenuId(null); }}
           >
             <LayoutDashboard size={18} />
             <span>Overview</span>
@@ -258,7 +290,7 @@ function App() {
               <button
                 key={type}
                 className={typeFilter === type ? 'nav-item active' : 'nav-item'}
-                onClick={() => setTypeFilter(type)}
+                onClick={() => { setTypeFilter(type); setMenuId(null); }}
               >
                 <Icon size={18} />
                 <span>{typeMeta[type].label}</span>
@@ -374,8 +406,8 @@ function App() {
                 </thead>
                 <tbody>
                   {!loading && resources.length === 0 && (
-                    <tr>
-                      <td colSpan={6}>
+                    <tr className="empty-row">
+                      <td className="empty-cell" colSpan={6}>
                         <div className="empty-state">
                           <div className="empty-icon"><Archive size={24} /></div>
                           <h3>No resources found</h3>
@@ -393,7 +425,7 @@ function App() {
 
                     return (
                       <tr key={item.id}>
-                        <td>
+                        <td data-label="Resource">
                           <div className="resource-name">
                             <div className={`resource-icon ${item.type}`}>
                               <Icon size={18} />
@@ -404,14 +436,14 @@ function App() {
                             </div>
                           </div>
                         </td>
-                        <td><span className="muted-detail">{item.summary || '—'}</span></td>
-                        <td>
+                        <td data-label="Details"><span className="muted-detail">{item.summary || '—'}</span></td>
+                        <td data-label="Status">
                           <span className={`status-pill ${computedStatus}`}>
                             {computedStatus}
                           </span>
                         </td>
-                        <td><ExpirationCell value={item.expiresAt} /></td>
-                        <td>
+                        <td data-label="Expiration"><ExpirationCell value={item.expiresAt} /></td>
+                        <td data-label="Secret">
                           <button
                             className="reveal-button"
                             onClick={() => toggleReveal(item.id)}
@@ -420,16 +452,21 @@ function App() {
                             {isRevealed ? 'Hide' : 'Reveal'}
                           </button>
                         </td>
-                        <td className="action-cell">
+                        <td className="action-cell" data-label="Actions" data-action-menu>
                           <button
                             className="icon-button small"
-                            onClick={() => setMenuId(menuId === item.id ? null : item.id)}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              setMenuId(menuId === item.id ? null : item.id);
+                            }}
+                            aria-label={`Actions for ${item.label}`}
+                            aria-expanded={menuId === item.id}
                           >
                             <MoreHorizontal size={17} />
                           </button>
 
                           {menuId === item.id && (
-                            <div className="action-menu">
+                            <div className="action-menu" data-action-menu>
                               <button onClick={() => openEdit(item.id)}>
                                 <Pencil size={15} /> Edit
                               </button>
@@ -455,7 +492,7 @@ function App() {
               <div className="panel-header compact">
                 <div>
                   <h2>Upcoming expirations</h2>
-                  <p>Next renewals to review</p>
+                  <p>Windows reminders at 7 and 3 days</p>
                 </div>
               </div>
 
@@ -593,7 +630,7 @@ function SecretPanel({
       ];
     }
 
-    if (resource.type === 'linkedin_account') {
+    if (isAccountType(resource.type)) {
       const employment = normalizeEmployment(d.employmentHistory);
       const education = normalizeEducation(d.education);
       const fullName = [d.firstName, d.lastName].filter(Boolean).join(' ');
@@ -635,7 +672,7 @@ function SecretPanel({
         ['County', d.county],
         ['SSN', d.ssn],
         ['Driver license', driverLicense],
-        ['LinkedIn URL', d.linkedinUrl],
+        [resource.type === 'linkedin_account' ? 'LinkedIn URL' : 'Upwork URL', d.profileUrl],
         ['Email', d.email],
         ['Password', d.password],
         ['Employment history', employmentText],
@@ -775,6 +812,7 @@ function ResourceModal({
     'google_voice',
     'whatsapp',
     'linkedin_account',
+    'upwork_account',
   ].includes(form.type);
 
   return (
@@ -783,7 +821,7 @@ function ResourceModal({
       onMouseDown={(event) => event.target === event.currentTarget && onClose()}
     >
       <form
-        className={form.type === 'linkedin_account' ? 'modal modal-wide' : 'modal'}
+        className={isAccountType(form.type) ? 'modal modal-wide' : 'modal'}
         onSubmit={submit}
       >
         <div className="modal-header">
@@ -822,7 +860,7 @@ function ResourceModal({
               <input
                 value={form.label}
                 onChange={(event) => updateRoot('label', event.target.value)}
-                placeholder="Example: Primary LinkedIn Account"
+                placeholder={`Example: Primary ${typeMeta[form.type].label.replace(/s$/, '')}`}
                 required
               />
             </Field>
@@ -858,8 +896,12 @@ function ResourceModal({
               />
             )}
 
-            {form.type === 'linkedin_account' && (
-              <LinkedInFields details={form.details} update={updateDetail} />
+            {isAccountType(form.type) && (
+              <AccountFields
+                type={form.type}
+                details={form.details}
+                update={updateDetail}
+              />
             )}
 
             {showExpiration && (
@@ -892,7 +934,7 @@ function ResourceModal({
             </div>
           )}
 
-          {form.type === 'linkedin_account' && (
+          {isAccountType(form.type) && (
             <div className="security-notice sensitive-notice">
               <ShieldCheck size={18} />
               <div>
@@ -1085,7 +1127,12 @@ function PhoneFields({
   );
 }
 
-function LinkedInFields({ details, update }: FieldGroupProps) {
+function AccountFields({
+  type,
+  details,
+  update,
+}: FieldGroupProps & { type: ResourceType }) {
+  const accountName = type === 'linkedin_account' ? 'LinkedIn' : 'Upwork';
   const employmentHistory = normalizeEmployment(details.employmentHistory);
   const education = normalizeEducation(details.education);
 
@@ -1145,7 +1192,7 @@ function LinkedInFields({ details, update }: FieldGroupProps) {
           <div className="section-heading-icon"><UserRound size={18} /></div>
           <div>
             <h3>Personal information</h3>
-            <p>Identity, location and LinkedIn sign-in details</p>
+            <p>Identity, location and {accountName} sign-in details</p>
           </div>
         </div>
 
@@ -1189,12 +1236,14 @@ function LinkedInFields({ details, update }: FieldGroupProps) {
               placeholder="Stored encrypted"
             />
           </Field>
-          <Field label="LinkedIn URL">
+          <Field label={`${accountName} profile URL`}>
             <input
               type="url"
-              value={String(details.linkedinUrl || '')}
-              onChange={(event) => update('linkedinUrl', event.target.value)}
-              placeholder="https://www.linkedin.com/in/profile-name/"
+              value={String(details.profileUrl || '')}
+              onChange={(event) => update('profileUrl', event.target.value)}
+              placeholder={type === 'linkedin_account'
+                ? 'https://www.linkedin.com/in/profile-name/'
+                : 'https://www.upwork.com/freelancers/~profile-id'}
             />
           </Field>
           <Field label="Street address" wide>
